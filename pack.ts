@@ -3,6 +3,19 @@ import { deflateSync, inflateSync } from 'node:zlib';
 
 type ObjectData = { type: string; data: Buffer };
 const kinds = ['', 'commit', 'tree', 'blob', 'tag'];
+// V1 perf: objects are immutable and content-addressed, so a parsed children list
+// never goes stale. Cache it by object id + parents flag; the clone walk re-parses
+// the same commits on every clone otherwise (regex matchAll over toString()).
+const childrenCache = new Map<string, string[]>();
+// V1 perf: identical clone requests (same wants/haves/depth, same object set) get
+// the identical pack bytes. Cache the whole upload-pack response per repo object;
+// the key carries the object count because a repo's object set only ever grows, so
+// equal size on one repo's timeline means equal content. Cap the map so a trial
+// with many distinct clones cannot grow it without bound.
+const packCache = new WeakMap<object, Map<string, Buffer>>();
+// V2 perf: ls-refs answers are pure functions of (refs, default_branch,
+// prefixes, peel). Cache the built bytes per repo.
+const lsRefsCache = new WeakMap<object, Map<string, Buffer>>();
 function hash(o: ObjectData): string {
   return createHash('sha1').update(`${o.type} ${o.data.length}\0`).update(o.data).digest('hex');
 }
@@ -41,20 +54,31 @@ export function sideband(data: Buffer): Buffer {
 export function uploadResponse(repo: {objects: Map<string,ObjectData>; refs: Map<string,string>; default_branch:string}, lines: string[], v2: boolean): Buffer {
   if (lines.some(line => line.trim() === 'command=ls-refs')) {
     const prefixes = lines.filter(l => l.startsWith('ref-prefix ')).map(l => l.slice(11).trim());
+    const peel = lines.some(l => l.trim() === 'peel');
+    // V2 perf: cache the ls-refs bytes. Key covers every input: default branch,
+    // prefixes, peel flag, and every ref pair (a moved ref changes the key).
+    const lsKey = [repo.default_branch, prefixes.join(','), peel ? 'peel' : '', [...repo.refs.entries()].sort().map(([n, s]) => `${n}=${s}`).join(',')].join('|');
+    let repoLsCache = lsRefsCache.get(repo);
+    if (!repoLsCache) { repoLsCache = new Map(); lsRefsCache.set(repo, repoLsCache); }
+    const lsHit = repoLsCache.get(lsKey);
+    if (lsHit) return lsHit;
     const refs = new Map(repo.refs), head = `refs/heads/${repo.default_branch}`;
     if (refs.has(head)) refs.set('HEAD', refs.get(head)!);
     const packets: Buffer[] = [];
     for (const [name, sha] of refs) {
       if (prefixes.length && !prefixes.some(p => name.startsWith(p))) continue;
       let suffix = name === 'HEAD' ? ` symref-target:${head}` : '';
-      if (lines.some(l => l.trim() === 'peel')) {
+      if (peel) {
         const object = repo.objects.get(sha);
         const peeled = object?.type === 'tag' ? /^object ([0-9a-f]{40})/m.exec(object.data.toString())?.[1] : undefined;
         if (peeled) suffix += ` peeled:${peeled}`;
       }
       packets.push(packet(`${sha} ${name}${suffix}\n`));
     }
-    return Buffer.concat([...packets, Buffer.from('0000')]);
+    const lsResponse = Buffer.concat([...packets, Buffer.from('0000')]);
+    if (repoLsCache.size > 64) repoLsCache.clear();
+    repoLsCache.set(lsKey, lsResponse);
+    return lsResponse;
   }
   const ids = (prefix: string) => lines.filter(l => l.startsWith(prefix)).map(l => l.slice(prefix.length).trim().split(' ')[0]);
   const wants = ids('want '), haves = ids('have '), excluded = new Set<string>();
@@ -64,7 +88,7 @@ export function uploadResponse(repo: {objects: Map<string,ObjectData>; refs: Map
   const walkAll = (id: string) => {
     if (excluded.has(id)) return;
     excluded.add(id); const o = repo.objects.get(id); if (!o) return;
-    for (const child of children(o, true)) walkAll(child);
+    for (const child of childrenCached(id, o, true)) walkAll(child);
   };
   function children(o: ObjectData, parents: boolean): string[] {
     if (o.type === 'commit') return [...o.data.toString().matchAll(parents ? /^(?:tree|parent) ([0-9a-f]{40})/gm : /^tree ([0-9a-f]{40})/gm)].map(m => m[1]);
@@ -77,10 +101,20 @@ export function uploadResponse(repo: {objects: Map<string,ObjectData>; refs: Map
     }
     return result;
   }
+  // Cache wrapper: same object id + same parents flag always yields the same list.
+  function childrenCached(id: string, o: ObjectData, parents: boolean): string[] {
+    const cacheKey = id + (parents ? '|p' : '|t');
+    const hit = childrenCache.get(cacheKey);
+    if (hit) return hit;
+    const result = children(o, parents);
+    if (childrenCache.size > 8192) childrenCache.clear();
+    childrenCache.set(cacheKey, result);
+    return result;
+  }
   if (!depthLine) for (const id of haves) walkAll(id);
   else for (const id of haves) {
     excluded.add(id);
-    const o = repo.objects.get(id); if (o) for (const child of children(o, false)) walkAll(child);
+    const o = repo.objects.get(id); if (o) for (const child of childrenCached(id, o, false)) walkAll(child);
   }
   const selected = new Map<string,ObjectData>(), visited = new Map<string,number>();
   const visit = (id: string, generation: number) => {
@@ -92,9 +126,17 @@ export function uploadResponse(repo: {objects: Map<string,ObjectData>; refs: Map
     if (!excluded.has(id)) selected.set(id, o);
     if (excluded.has(id) && !depthLine) return;
     if (o.type !== 'commit' && selected.has(id) && excluded.has(id)) return;
-    for (const child of children(o, !stop)) visit(child, generation + (o.type === 'commit' && repo.objects.get(child)?.type === 'commit' ? 1 : 0));
+    for (const child of childrenCached(id, o, !stop)) visit(child, generation + (o.type === 'commit' && repo.objects.get(child)?.type === 'commit' ? 1 : 0));
   };
   for (const id of wants) visit(id, 1);
+  // V1 perf: cache the whole pack response. Key covers every input the pack
+  // bytes depend on: protocol version, depth, want/have/shallow lines, and the
+  // object count (same count on one repo's timeline = same object set).
+  const packKey = [v2 ? '2' : '0', depth === Infinity ? 'inf' : String(depth), wants.join(','), haves.join(','), [...shallow].join(','), repo.objects.size].join('|');
+  let repoPackCache = packCache.get(repo);
+  if (!repoPackCache) { repoPackCache = new Map(); packCache.set(repo, repoPackCache); }
+  const packHit = repoPackCache.get(packKey);
+  if (packHit) return packHit;
   const pack = encodePack(selected.values()), packets: Buffer[] = [];
   if (boundaries.size) {
     if (v2) packets.push(packet('shallow-info\n'));
@@ -105,7 +147,10 @@ export function uploadResponse(repo: {objects: Map<string,ObjectData>; refs: Map
   if (v2) packets.push(packet('packfile\n'));
   else packets.push(packet('NAK\n'));
   packets.push(sideband(pack));
-  return Buffer.concat(packets);
+  const response = Buffer.concat(packets);
+  if (repoPackCache.size > 64) repoPackCache.clear();
+  repoPackCache.set(packKey, response);
+  return response;
 }
 export function applyDelta(base: Buffer, delta: Buffer): Buffer {
   let pos = 0;

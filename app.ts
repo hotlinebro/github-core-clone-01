@@ -8,6 +8,10 @@ type Issue = { id: number; number: number; title: string; body: string; state: s
 type Pull = { id: number; number: number; title: string; body: string; state: string; head: string; base: string; merged: boolean; merge_commit_sha: string | null };
 type Repo = { id: number; owner: string; name: string; description: string; private: boolean; default_branch: string; refs: Map<string,string>; objects: Map<string,Obj>; issues: Map<number,Issue>; pulls: Map<number,Pull>; labels: Map<string,string>; contents: Map<string,{sha:string;data:Buffer}>; branches: Map<string,string> };
 const repos = new Map<string,Repo>();
+// V2 perf: the v2 capability advertisement is constant bytes. Build it once
+// instead of ~15 Buffer allocations on every info/refs request (the clone flow
+// alone asks for it 3 times per clone).
+const V2_ADVERTISEMENT = Buffer.concat([pkt('version 2\n'), pkt('agent=forge/1\n'), pkt('ls-refs=unborn\n'), pkt('fetch=shallow wait-for-done filter\n'), pkt('server-option\n'), pkt('object-format=sha1\n'), flush()]);
 let nextId = 1000;
 const key = (o: string, r: string) => `${o.toLowerCase()}/${r.toLowerCase()}`;
 const oid = (type: string, data: Buffer) => createHash('sha1').update(`${type} ${data.length}\0`).update(data).digest('hex');
@@ -166,7 +170,7 @@ async function git(req:IncomingMessage,res:ServerResponse,url:URL){
  const receive=bits.at(-1)==='git-receive-pack'||url.searchParams.get('service')==='git-receive-pack';const service=receive?'git-receive-pack':'git-upload-pack';
  if(bits.slice(-2).join('/')==='info/refs'){
   const v2=!receive&&req.headers['git-protocol']==='version=2';res.statusCode=200;res.setHeader('content-type',`application/x-${service}-advertisement`);res.setHeader('cache-control','no-cache');
-  if(v2){res.end(Buffer.concat([pkt('version 2\n'),pkt('agent=forge/1\n'),pkt('ls-refs=unborn\n'),pkt('fetch=shallow wait-for-done filter\n'),pkt('server-option\n'),pkt('object-format=sha1\n'),flush()]));return;}
+  if(v2){res.end(V2_ADVERTISEMENT);return;}
   const cap=receive?'report-status side-band-64k delete-refs ofs-delta agent=forge/1':'multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta shallow deepen-since deepen-not deepen-relative agent=forge/1';const out=[pkt(`# service=${service}\n`),flush()];const head=r.refs.get(`refs/heads/${r.default_branch}`);if(head)out.push(pkt(`${head} HEAD\0${cap} symref=HEAD:refs/heads/${r.default_branch}\n`));for(const [ref,sha] of r.refs)out.push(pkt(`${sha} ${ref}\n`));if(!r.refs.size)out.push(pkt(`${'0'.repeat(40)} capabilities^{}\0${cap}\n`));out.push(flush());res.end(Buffer.concat(out));return;
  }
  const raw=await readBody(req);
